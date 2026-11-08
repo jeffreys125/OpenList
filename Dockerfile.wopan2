@@ -1,0 +1,56 @@
+# OpenList + 联通网盘2（wopan2）高速上传驱动 的自定义构建文件。
+#
+# 与官方 Dockerfile 的区别：
+#  1. builder 固定为 golang:1.27-alpine，避免 alpine:edge 里 go 版本漂移；
+#  2. 前端使用固定版本的 release 包下载，不走 GitHub API（避免 2 秒超时失败），
+#     并允许通过 GH_PROXY 指定下载代理；
+#  3. CGO_ENABLED=0 静态编译 —— 项目使用 glebarez/go-sqlite（纯 Go SQLite），
+#     不需要 cgo，产物可在任意 Linux 基础镜像里直接运行。
+#
+# 构建：docker compose up -d --build
+# 国内网络建议：
+#   GOPROXY=https://goproxy.cn,direct GH_PROXY=https://gh-proxy.com/ docker compose up -d --build
+
+ARG GO_IMAGE=golang:1.27-alpine
+ARG BASE_IMAGE_TAG=base
+
+FROM ${GO_IMAGE} AS builder
+WORKDIR /app
+
+ARG GOPROXY=https://proxy.golang.org,direct
+ENV GOPROXY=${GOPROXY} CGO_ENABLED=0
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+
+# 前端静态资源会被 //go:embed all:dist 编译进二进制。
+ARG FRONTEND_DIST_URL=https://github.com/OpenListTeam/OpenList-Frontend/releases/download/v4.2.9/openlist-frontend-dist-v4.2.9.tar.gz
+ARG GH_PROXY=
+RUN wget -q -O /tmp/frontend.tgz "${GH_PROXY}${FRONTEND_DIST_URL}" \
+ && rm -rf public/dist && mkdir -p public/dist \
+ && tar -xzf /tmp/frontend.tgz -C public/dist \
+ && rm -f /tmp/frontend.tgz
+
+RUN go build -tags=jsoniter -trimpath -ldflags="-w -s" -o /app/bin/openlist .
+
+FROM openlistteam/openlist-base-image:${BASE_IMAGE_TAG}
+LABEL MAINTAINER="jeffreys125"
+ARG USER=openlist
+ARG UID=1001
+ARG GID=1001
+
+WORKDIR /opt/openlist/
+RUN addgroup -g ${GID} ${USER} && \
+    adduser -D -u ${UID} -G ${USER} ${USER} && \
+    mkdir -p /opt/openlist/data
+
+COPY --from=builder --chmod=755 --chown=${UID}:${GID} /app/bin/openlist ./openlist
+COPY --chmod=755 --chown=${UID}:${GID} entrypoint.sh /entrypoint.sh
+
+USER ${USER}
+RUN /entrypoint.sh version
+
+ENV UMASK=022 RUN_ARIA2=false
+VOLUME /opt/openlist/data/
+EXPOSE 5244 5245
+CMD [ "/entrypoint.sh" ]

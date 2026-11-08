@@ -1,8 +1,21 @@
 services:
   openlist:
+    container_name: openlist
     restart: always
+    # 镜像名与随附的预构建镜像包一致：
+    #   - 已 docker load 过镜像时，直接 `docker compose up -d` 即可，不联网、不编译；
+    #   - 想从本仓库源码自行构建时，用 `docker compose up -d --build`。
+    image: openlist-wopan2:local
+    build:
+      context: .
+      dockerfile: Dockerfile.wopan2
+      args:
+        # 国内服务器可在此换成 https://goproxy.cn,direct
+        GOPROXY: ${GOPROXY:-https://proxy.golang.org,direct}
+        # GitHub Release 下载不通时，可填 https://gh-proxy.com/ 之类的代理前缀
+        GH_PROXY: ${GH_PROXY:-}
     volumes:
-      - '/etc/openlist:/opt/openlist/data'
+      - './data:/opt/openlist/data'
     ports:
       - '5244:5244'
       - '5245:5245'
@@ -10,5 +23,3 @@ services:
     environment:
       - UMASK=022
       - TZ=Asia/Shanghai
-    container_name: openlist
-    image: 'openlistteam/openlist:latest'
