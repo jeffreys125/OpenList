@@ -23,7 +23,7 @@ type Addition struct {
 	FamilyID     string `json:"family_id" help:"家庭空间 ID，留空使用个人空间"`
 	SortRule     string `json:"sort_rule" type:"select" options:"name_asc,name_desc,time_asc,time_desc,size_asc,size_desc" default:"name_asc" help:"目录排序规则"`
 
-	UploadHost   string `json:"upload_host" default:"https://tjupload.pan.wo.cn" help:"上传节点，默认 tjupload（实测 5~7MB/s）。重要：管理后台已保存的旧配置不会随代码更新，必须手动改成 https://tjupload.pan.wo.cn！候选：tjupload（推荐）、hyupload（ltpan.py 默认，已限速约 0.3MB/s）、gxupload:8443（已停用）。可用随附的 diagnose.py 在你的服务器上测出最快节点"`
+	UploadHost   string `json:"upload_host" default:"https://tjupload.pan.wo.cn" help:"上传节点，默认 tjupload（实测 5~7MB/s）。旧版保存的 hyupload 会自动迁移到 tjupload，但建议手动改成明确值。候选：tjupload（推荐）、hyupload（ltpan.py 默认，已被限速约 0.3MB/s）、gxupload:8443（已停用）；强制用 hyupload 可填 https://hyupload.pan.wo.cn:443。用 tools/wopan2/diagnose.py 可在你的服务器上测出最快节点"`
 	TransferHost string `json:"transfer_host" default:"https://b.smartont.net" help:"秒传 / 文件校验节点；仅在开启秒传时使用"`
 	ChunkSize    int64  `json:"chunk_size" type:"number" default:"8" help:"分片大小（MB），默认 8，允许 8-128。注意：管理后台已保存的旧配置不会随代码默认值变化，需手动改"`
 	Concurrency  int    `json:"concurrency" type:"number" default:"4" help:"分片并发上传数，默认 4，允许 1-16。若节点/账号被服务端限速，并发不会提速，建议设为 1"`

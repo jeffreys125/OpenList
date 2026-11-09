@@ -46,6 +46,8 @@ import (
 const (
 	defaultUploadHost   = "https://tjupload.pan.wo.cn"
 	defaultTransferHost = "https://b.smartont.net"
+	// legacyUploadHost 是旧版本写进配置数据库的默认节点，现已被服务端限速。
+	legacyUploadHost = "https://hyupload.pan.wo.cn"
 
 	appClientID = "1001000035"
 	appVersion  = "yp-app/6.5.0"
@@ -175,6 +177,20 @@ func cleanHost(h, fallback string) string {
 	h = strings.TrimRight(strings.TrimSpace(h), "/")
 	if h == "" {
 		return fallback
+	}
+	return h
+}
+
+// uploadHost 返回本次上传实际使用的节点。
+// 旧版本把 hyupload 作为默认值持久化进了存储配置；升级镜像不会覆盖已保存的
+// 值，所以这里做一次兼容迁移：配置恰好等于旧默认节点时自动改用新默认节点，
+// 确保用户「只重建镜像、不改配置」也能脱离被限速的通道。
+// 若确需强制使用旧节点，填写 https://hyupload.pan.wo.cn:443（带端口）即可绕过。
+func (d *Wopan2) uploadHost() string {
+	h := cleanHost(d.UploadHost, defaultUploadHost)
+	if h == legacyUploadHost {
+		log.Infof("[联通网盘2] 配置中仍是旧版默认节点 %s（已被服务端限速），自动改用 %s；如需强制使用请填写 %s:443", h, defaultUploadHost, h)
+		return defaultUploadHost
 	}
 	return h
 }
@@ -413,7 +429,7 @@ func (d *Wopan2) uploadParts(ctx context.Context, f model.File, token, name stri
 		"directoryId": dirID,
 		"fileInfo":    fileInfoStr,
 	}
-	url := cleanHost(d.UploadHost, defaultUploadHost) + "/openapi/client/upload2C"
+	url := d.uploadHost() + "/openapi/client/upload2C"
 
 	var sent int64
 	var fidMu sync.Mutex
@@ -517,7 +533,7 @@ func (d *Wopan2) uploadParts(ctx context.Context, f model.File, token, name stri
 	if elapsed > 0 && size > 0 {
 		rateMB = float64(size) / elapsed.Seconds() / 1024 / 1024
 	}
-	host := cleanHost(d.UploadHost, defaultUploadHost)
+	host := d.uploadHost()
 	log.Infof("[联通网盘2] 上传完成: %d 片, %d 字节, 耗时 %s, 实测 %.2f MB/s | 生效配置: 节点=%s 分片=%dMB 并发=%d 秒传=%v 重试=%d",
 		totalPart, size, elapsed.Round(time.Millisecond), rateMB, host, partSize>>20, workers, d.EnableQuick, d.retryTimes())
 	if rateMB < 1.5 {

@@ -41,10 +41,11 @@ cat <<'EOF'
   实际打在同一被限速节点；用户自己的 Python 原程序打 hyupload 也只有
   0.8MB/s。即与 OpenList / 驱动代码无关，改分片、并发、秒传、换 token 都无效。
 
-★ 必须做的一步：管理后台里已保存的 upload_host 不会随镜像更新，
-  请编辑「联通网盘2」存储，把 upload_host 手动改成：
+★ 建议做的一步（新版已能自动迁移，改成明确值最稳妥）：
+  管理后台 -> 编辑「联通网盘2」存储，把 upload_host 设为：
       https://tjupload.pan.wo.cn
-  保存后重新测试离线下载。
+  新版代码会自动把旧默认值 hyupload 迁移到 tjupload，因此只重建镜像、
+  不改配置也能生效；但已保存的配置本身不会变，显式填好可避免歧义。
 
 ★ 想确认你的服务器上哪个节点最快（不同网络/运营商结论可能不同）：
   WOPAN_TOKEN='你的access_token' python3 tools/wopan2/diagnose.py
