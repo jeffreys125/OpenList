@@ -14,7 +14,9 @@ import (
 	"fmt"
 	"io"
 	"math/rand"
+	"net"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -25,6 +27,7 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/wopan-sdk-go"
 	"github.com/go-resty/resty/v2"
+	log "github.com/sirupsen/logrus"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -53,6 +56,13 @@ const (
 
 	uploadTimeout = 15 * time.Minute
 	deviceIDLen   = 32
+
+	// 秒传查询是「控制类」请求，命中率本身很低（尤其离线下载的 URL 资源），
+	// 却位于上传链路的最前面。它必须快速失败并降级，绝不能拖住整个 Put。
+	// 修复前该请求与分片上传共用 15 分钟超时的客户端，节点不可达时
+	// 会让上传在开始前白等几十秒到几分钟，UI 上的平均速度被拉到几十 K。
+	quickTransferTimeout = 6 * time.Second
+	dialTimeout          = 8 * time.Second
 )
 
 const (
@@ -82,7 +92,11 @@ func randHexUpper(n int) string {
 // 更大的连接池（并发分片需要）+ 长超时（大分片需要），且 UA / header 互不干扰。
 func newUploadClient() *resty.Client {
 	transport := &http.Transport{
-		Proxy:                 http.ProxyFromEnvironment,
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   dialTimeout,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
 		MaxIdleConns:          100,
 		MaxIdleConnsPerHost:   32,
 		IdleConnTimeout:       90 * time.Second,
@@ -287,9 +301,24 @@ func (d *Wopan2) fastUpload(ctx context.Context, dstDir model.Obj, stream model.
 	}
 	upPart := model.UpdateProgressWithRange(up, 10, 100)
 
+	// 秒传默认关闭：离线下载的 URL 资源几乎不可能已在网盘中存在，
+	// 但每次开启都要额外完整扫一遍文件算 SHA256 + 一次跨网请求，纯属前置开销。
+	// 即便手动开启，也必须使用独立的短超时上下文：b.smartont.net 在部分网络下
+	// 响应极慢或不可达，修复前它与分片上传共用 15 分钟超时客户端且失败被静默吞掉，
+	// 导致整个 Put 在上传开始前白等几十秒到几分钟（UI 上表现为「几十 K」）。
 	if d.EnableQuick && size > 0 {
-		if sha, e := sha256Of(cached, size); e == nil {
-			if fid, e := d.quickTransfer(ctx, token, name, size, sha, dstDir.GetID(), stream.ModTime()); e == nil && fid != "" {
+		quickCtx, cancel := context.WithTimeout(ctx, quickTransferTimeout)
+		defer cancel()
+		sha, e := sha256Of(cached, size)
+		switch {
+		case e != nil:
+			log.Warnf("[联通网盘2] 计算 SHA256 失败，跳过秒传直接上传: %v", e)
+		default:
+			fid, e := d.quickTransfer(quickCtx, token, name, size, sha, dstDir.GetID(), stream.ModTime())
+			switch {
+			case e != nil:
+				log.Warnf("[联通网盘2] 秒传查询在 %s 内未完成（节点不可达或超时），已跳过秒传直接上传: %v", quickTransferTimeout, e)
+			case fid != "":
 				upPart(100)
 				return nil
 			}
@@ -376,7 +405,12 @@ func (d *Wopan2) uploadParts(ctx context.Context, f model.File, token, name stri
 			if err := c.Err(); err != nil {
 				return err
 			}
+			partStart := time.Now()
 			gotFID, err := d.sendPart(c, url, common, f, token, name, idx, offset, length)
+			if os.Getenv("WOPAN2_DEBUG_PARTS") != "" {
+				log.Warnf("[联通网盘2] 分片 %d/%d 第 %d 次尝试: 长度 %d 字节, 耗时 %s, err=%v",
+					idx, totalPart, attempt+1, length, time.Since(partStart), err)
+			}
 			if err == nil {
 				if gotFID != "" {
 					fidMu.Lock()
