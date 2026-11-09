@@ -23,6 +23,10 @@ cat <<'EOF'
 
 添加存储：管理后台 -> 存储 -> 添加 -> 驱动选择「联通网盘2」
   必填：access_token（或 refresh_token）
-  可选：chunk_size（默认16MB，最小8MB）、concurrency（默认4）、enable_quick（秒传）
+  可选：chunk_size（默认16MB，最小8MB）、concurrency（默认4）
+  秒传 enable_quick 默认关闭，离线下载 / URL 转存请保持关闭：
+    秒传要先算整文件 SHA256 再访问 b.smartont.net，该节点在部分服务器网络下
+    响应极慢或不可达，会把上传拖成「几十 K/s」。旧配置里若已开启，请手动关掉。
   上传节点 upload_host 默认已是 App 高速节点 https://hyupload.pan.wo.cn，请勿改成网页节点。
+  诊断：上传慢时可在 compose 里加环境变量 WOPAN2_DEBUG_PARTS=1，日志会打印每个分片耗时。
 EOF
