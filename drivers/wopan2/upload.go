@@ -46,10 +46,12 @@ const (
 	// AES-CBC 固定 IV；key = accessToken[:16]，与 SDK / ltpan.py 完全一致。
 	aesIV = "wNSOYIB1k1DjY5lA"
 
-	defaultPartSize = int64(16 << 20)
+	// 实测：单个请求体超过约 8MB 时 hyupload 节点会掉到 ~350KB/s 的慢速通道，
+	// 8MB 分片可稳定跑 5-15MB/s。默认与 SDK / 原驱动保持一致，
+	// 也是 ltpan.py 实测高速时使用的尺寸（脚本虽默认 16，但每片严格 <= 分片大小）。
+	defaultPartSize = int64(8 << 20)
 	// 服务端对分片大小有下限：实测 1MB / 4MB 分片在合并最后一片时返回
 	// HTTP 500，8MB 及以上分片（整除、不整除、多片）均可正常合并。
-	// 与 wopan-sdk-go 的 DefaultPartSize(8MB) 保持一致。
 	minPartSize = int64(8 << 20)
 	maxPartSize = int64(128 << 20)
 	maxWorkers  = 16
@@ -291,15 +293,30 @@ func (d *Wopan2) fastUpload(ctx context.Context, dstDir model.Obj, stream model.
 		return fmt.Errorf("access token 无效：至少需要 16 位")
 	}
 
-	cacheUp := model.UpdateProgressWithRange(up, 0, 10)
-	cached, err := stream.CacheFullAndWriter(&cacheUp, nil)
-	if err != nil {
-		return fmt.Errorf("缓存上传流失败: %w", err)
+	// 离线下载传入的 FileStreamer，其底层 Reader 往往已经是 *os.File
+	// （本地临时文件），或者是一个远程 HTTP Range 流。前者应当直接复用、
+	// 不做任何额外复制；后者才需要缓存成可随机读的 model.File。
+	// 无条件调用 CacheFullAndWriter 会在上传开始前多出一次完整读/复制，
+	// 这段时间不计入上传吞吐，却计入任务耗时，把 UI 平均速度拉低。
+	var cached model.File
+	upPart := up
+	if f := stream.GetFile(); f != nil {
+		if _, err := f.Seek(0, io.SeekStart); err != nil {
+			return fmt.Errorf("重置上传流失败: %w", err)
+		}
+		cached = f
+	} else {
+		cacheUp := model.UpdateProgressWithRange(up, 0, 10)
+		var err error
+		cached, err = stream.CacheFullAndWriter(&cacheUp, nil)
+		if err != nil {
+			return fmt.Errorf("缓存上传流失败: %w", err)
+		}
+		if cached == nil {
+			return errors.New("缓存上传流失败：返回空文件")
+		}
+		upPart = model.UpdateProgressWithRange(up, 10, 100)
 	}
-	if cached == nil {
-		return errors.New("缓存上传流失败：返回空文件")
-	}
-	upPart := model.UpdateProgressWithRange(up, 10, 100)
 
 	// 秒传默认关闭：离线下载的 URL 资源几乎不可能已在网盘中存在，
 	// 但每次开启都要额外完整扫一遍文件算 SHA256 + 一次跨网请求，纯属前置开销。
@@ -328,31 +345,31 @@ func (d *Wopan2) fastUpload(ctx context.Context, dstDir model.Obj, stream model.
 	return d.uploadParts(ctx, cached, token, name, size, dstDir.GetID(), upPart)
 }
 
-// partLayout 按「SDK 风格」计算分片（与 wopan-sdk-go 的 Upload2C 一致）：
-//   - totalPart = size / partSize（整除向下）；
-//   - 前 totalPart-1 片各 partSize，最后一片吃掉全部剩余（可大于 partSize）。
+// partLayout 严格复刻 ltpan.py 的分片算法：
+//   - totalPart = ceil(size / partSize)；
+//   - 每片长度 min(partSize, size-offset)，即任何一片都不会超过 partSize。
 //
-// 关键实测结论：服务端要求分片不小于约 8MB，过小的分片会让合并最后一片时
-// 返回 HTTP 500。partSize() 会把低于 minPartSize 的配置自动提升，因此这里
-// 拿到的 partSize 一定是安全的；在安全分片大小下，整除 / 不整除、2 片 / 3 片
-// 都能正常合并并返回 fid。
+// 这里曾经错误地照搬 wopan-sdk-go 的 floor 算法（最后一片 = 余数 + partSize，
+// 最大可达 2*partSize）。当文件大小不是分片大小的整数倍时——离线下载几乎
+// 必然如此——默认 16MB 配置会产生单个 20MB/24MB/32MB 的巨型请求，实测被
+// hyupload 节点稳定限在约 350KB/s；而此前所有高速回归用例恰好都是 8MB 的
+// 整数倍，floor 与 ceil 结果相同，所以从未暴露。修复后每片 <= partSize，
+// 与 Python 程序字节级一致。
 func partLayout(size, partSize int64) (int64, []int64) {
 	if partSize <= 0 {
 		partSize = defaultPartSize
 	}
-	total := size / partSize
-	if total == 0 {
-		total = 1
+	if size <= 0 {
+		return 1, []int64{0}
 	}
+	total := (size + partSize - 1) / partSize
 	lengths := make([]int64, total)
-	for i := int64(1); i <= total; i++ {
-		lengths[i-1] = partSize
-		if i == total {
-			lengths[i-1] = size - (i-1)*partSize
+	for i := int64(0); i < total; i++ {
+		length := partSize
+		if remain := size - i*partSize; remain < length {
+			length = remain
 		}
-		if lengths[i-1] < 0 {
-			lengths[i-1] = 0
-		}
+		lengths[i] = length
 	}
 	return total, lengths
 }
@@ -393,9 +410,25 @@ func (d *Wopan2) uploadParts(ctx context.Context, f model.File, token, name stri
 	}
 	url := cleanHost(d.UploadHost, defaultUploadHost) + "/openapi/client/upload2C"
 
-	var done int64
+	var sent int64
 	var fidMu sync.Mutex
 	var fid string
+	start := time.Now()
+
+	// 按实际发出去的字节连续上报，而不是等整片上传完成才跳一次。
+	// 修复前 8/16MB 分片传输期间进度长时间停在原地，前端按「已传字节/耗时」
+	// 算出的速度被稀释成几十 K，与真实网络吞吐严重不符。
+	report := func(n int64) {
+		if size <= 0 || n <= 0 {
+			return
+		}
+		cur := atomic.AddInt64(&sent, n)
+		p := float64(cur) * 100 / float64(size)
+		if p > 100 {
+			p = 100 // 分片重传会让 sent 暂时超过 size，收尾时会强制校正
+		}
+		up(p)
+	}
 
 	sendOne := func(c context.Context, idx int64) error {
 		offset := (idx - 1) * partSize
@@ -406,7 +439,7 @@ func (d *Wopan2) uploadParts(ctx context.Context, f model.File, token, name stri
 				return err
 			}
 			partStart := time.Now()
-			gotFID, err := d.sendPart(c, url, common, f, token, name, idx, offset, length)
+			gotFID, err := d.sendPart(c, url, common, f, token, name, idx, offset, length, report)
 			if os.Getenv("WOPAN2_DEBUG_PARTS") != "" {
 				log.Warnf("[联通网盘2] 分片 %d/%d 第 %d 次尝试: 长度 %d 字节, 耗时 %s, err=%v",
 					idx, totalPart, attempt+1, length, time.Since(partStart), err)
@@ -418,10 +451,6 @@ func (d *Wopan2) uploadParts(ctx context.Context, f model.File, token, name stri
 						fid = gotFID
 					}
 					fidMu.Unlock()
-				}
-				cur := atomic.AddInt64(&done, length)
-				if size > 0 {
-					up(float64(cur) * 100 / float64(size))
 				}
 				return nil
 			}
@@ -461,15 +490,37 @@ func (d *Wopan2) uploadParts(ctx context.Context, f model.File, token, name stri
 		return err
 	}
 
-	if size == 0 {
-		up(100)
-	}
+	// 强制校正进度（分片重传可能让 sent 暂时超过真实大小）。
+	up(100)
 	// 服务端按 batchNo + partIndex 自行合并，返回的 fid 仅用于记录。
 	_ = fid
+	if os.Getenv("WOPAN2_DEBUG_PARTS") != "" {
+		elapsed := time.Since(start)
+		var rateMB float64
+		if elapsed > 0 && size > 0 {
+			rateMB = float64(size) / elapsed.Seconds() / 1024 / 1024
+		}
+		log.Warnf("[联通网盘2] 上传完成: %d 片, %d 字节, 耗时 %s, 实测 %.2f MB/s (分片 %dMB, 并发 %d)",
+			totalPart, size, elapsed.Round(time.Millisecond), rateMB, partSize>>20, workers)
+	}
 	return nil
 }
 
-func (d *Wopan2) sendPart(ctx context.Context, url string, common map[string]string, f model.File, token, name string, idx, offset, length int64) (string, error) {
+// countingReader 按实际从分片读取的字节数实时触发进度回调。
+type countingReader struct {
+	r      io.Reader
+	onRead func(int64)
+}
+
+func (r *countingReader) Read(p []byte) (int, error) {
+	n, err := r.r.Read(p)
+	if n > 0 && r.onRead != nil {
+		r.onRead(int64(n))
+	}
+	return n, err
+}
+
+func (d *Wopan2) sendPart(ctx context.Context, url string, common map[string]string, f model.File, token, name string, idx, offset, length int64, onRead func(int64)) (string, error) {
 	form := make(map[string]string, len(common)+2)
 	for k, v := range common {
 		form[k] = v
@@ -481,14 +532,17 @@ func (d *Wopan2) sendPart(ctx context.Context, url string, common map[string]str
 	defer cancel()
 
 	section := io.NewSectionReader(f, offset, length)
-	limited := driver.NewLimitedUploadStream(partCtx, section)
+	var body io.Reader = driver.NewLimitedUploadStream(partCtx, section)
+	if onRead != nil {
+		body = &countingReader{r: body, onRead: onRead}
+	}
 
 	var resp uploadResp
 	req := d.uploadClient.R().
 		SetHeaders(d.appHeaders(token)).
 		SetHeader("User-Agent", okgoUA).
 		SetMultipartFormData(form).
-		SetMultipartField("file", name, "application/octet-stream", limited).
+		SetMultipartField("file", name, "application/octet-stream", body).
 		ForceContentType("application/json;charset=UTF-8").
 		SetResult(&resp).
 		SetContext(partCtx)

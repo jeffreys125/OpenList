@@ -108,8 +108,12 @@ func TestPartSizeAndConcurrency(t *testing.T) {
 	}
 }
 
-// TestPartLayout 验证 SDK 风格分片算法：整除向下、最后一片吃掉剩余，
+// TestPartLayout 验证与 ltpan.py 一致的 ceil 分片算法：
+// totalPart = ceil(size/partSize)，每片长度都不超过 partSize，
 // 且所有分片长度之和必须等于文件大小。
+//
+// 回归重点：离线下载的文件大小几乎不可能是分片大小的整数倍。
+// 旧实现用 floor，20MB/16MB 会退化成单个 20MB 请求，被服务端限速。
 func TestPartLayout(t *testing.T) {
 	mb := int64(1 << 20)
 	cases := []struct {
@@ -123,9 +127,11 @@ func TestPartLayout(t *testing.T) {
 		{"小于一片", mb / 2, mb, 1, []int64{mb / 2}},
 		{"恰好一片", mb, mb, 1, []int64{mb}},
 		{"整除三片", 3 * mb, mb, 3, []int64{mb, mb, mb}},
-		{"不整除", 3*mb + 12345, mb, 3, []int64{mb, mb, mb + 12345}},
-		{"SDK 风格不整除", 21 * mb, 8 * mb, 2, []int64{8 * mb, 13 * mb}},
-		{"SDK 风格整除", 20 * mb, 8 * mb, 2, []int64{8 * mb, 12 * mb}},
+		{"不整除", 3*mb + 12345, mb, 4, []int64{mb, mb, mb, 12345}},
+		{"21MB / 8MB", 21 * mb, 8 * mb, 3, []int64{8 * mb, 8 * mb, 5 * mb}},
+		{"20MB / 8MB", 20 * mb, 8 * mb, 3, []int64{8 * mb, 8 * mb, 4 * mb}},
+		{"离线下载典型 20MB / 16MB", 20 * mb, 16 * mb, 2, []int64{16 * mb, 4 * mb}},
+		{"离线下载典型 40MB / 16MB", 40 * mb, 16 * mb, 3, []int64{16 * mb, 16 * mb, 8 * mb}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -250,13 +256,13 @@ func TestUploadPartsMock(t *testing.T) {
 
 	mu.Lock()
 	defer mu.Unlock()
-	// SDK 风格：size=3*8MB+12345, partSize=8MB -> totalPart=3
-	if len(parts) != 3 {
-		t.Fatalf("分片数 = %d, 期望 3（SDK 风格整除）", len(parts))
+	// ceil 算法：size=3*8MB+12345, partSize=8MB -> totalPart=4，最后一片 12345 字节
+	if len(parts) != 4 {
+		t.Fatalf("分片数 = %d, 期望 4（ceil 分片）", len(parts))
 	}
 	// 按 partIndex 拼接，必须与原始内容完全一致
 	var joined []byte
-	for i := int64(1); i <= 3; i++ {
+	for i := int64(1); i <= 4; i++ {
 		joined = append(joined, parts[i]...)
 	}
 	if int64(len(joined)) != size {
@@ -268,9 +274,9 @@ func TestUploadPartsMock(t *testing.T) {
 		}
 	}
 
-	for i := int64(1); i <= 3; i++ {
+	for i := int64(1); i <= 4; i++ {
 		v := form[i]
-		if v["totalPart"] != "3" {
+		if v["totalPart"] != "4" {
 			t.Errorf("分片 %d totalPart = %q", i, v["totalPart"])
 		}
 		if v["channel"] != "wocloud" {
@@ -283,8 +289,8 @@ func TestUploadPartsMock(t *testing.T) {
 			t.Errorf("分片 %d partIndex = %q", i, v["partIndex"])
 		}
 		wantLen := mb
-		if i == 3 {
-			wantLen = size - 2*mb // 最后一片吃掉全部剩余
+		if i == 4 {
+			wantLen = size - 3*mb // 最后一片是余数，绝不能超过 partSize
 		}
 		if v["partSize"] != strconv.FormatInt(wantLen, 10) {
 			t.Errorf("分片 %d partSize = %q, 期望 %d", i, v["partSize"], wantLen)
