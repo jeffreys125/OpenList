@@ -328,7 +328,7 @@ func TestUploadPartsMock(t *testing.T) {
 }
 
 // TestE2ERealUpload 默认跳过；设置 WOPAN2_E2E_TOKEN 后会对真实的
-// hyupload.pan.wo.cn 通道上传一个 1MB 测试文件，用于验证端到端连通性。
+// App 通道上传一个 1MB 测试文件，用于验证端到端连通性。
 func TestE2ERealUpload(t *testing.T) {
 	token := os.Getenv("WOPAN2_E2E_TOKEN")
 	if token == "" {

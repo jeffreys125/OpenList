@@ -54,6 +54,10 @@ func (d *Wopan2) GetAddition() driver.Additional {
 func (d *Wopan2) Init(ctx context.Context) error {
 	d.deviceID = randString(deviceIDLen, deviceCharset)
 	d.uploadClient = newUploadClient()
+	// 打印「数据库里实际保存」的配置，便于确认旧配置是否被覆盖。
+	// 代码里改默认值不会影响已保存的存储配置，这一点最容易造成误判。
+	log.Infof("[联通网盘2] 存储生效配置 | 节点=%s 分片=%dMB 并发=%d 秒传=%v 重试=%d（如需调整请在管理后台编辑该存储）",
+		cleanHost(d.UploadHost, defaultUploadHost), d.partSize()>>20, d.concurrency(), d.EnableQuick, d.retryTimes())
 
 	d.client = wopan.DefaultWithRefreshToken(d.RefreshToken)
 	d.client.SetAccessToken(d.AccessToken)

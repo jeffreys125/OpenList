@@ -32,10 +32,19 @@ import (
 )
 
 // App 通道常量，全部来自 ltpan.py 的实测配置。
-// 关键差异：上传节点是 hyupload.pan.wo.cn（App 专用、不限速），
-// 而不是 SDK 使用的 tjupload.pan.wo.cn / GetZoneInfo 网页节点。
+// 与原驱动的关键差异是 headers / Client-Id 与并发分片策略，API 相同；
+// 上传节点的选择才是吞吐的决定因素，见下方 defaultUploadHost 说明。
+// defaultUploadHost 经过实测后改为 tjupload.pan.wo.cn。
+// 同一 token、同一 App headers、同一 upload2C 接口、同一 21MB 文件：
+//
+//	hyupload.pan.wo.cn  -> 0.26~0.36 MB/s（该节点被服务端限速，与账号、分片、并发无关）
+//	tjupload.pan.wo.cn  -> 5.0~7.0 MB/s
+//
+// 注意 SDK 的 GetZoneInfo 会动态返回 hyupload，所以原「联通网盘」驱动的网页
+// 通道实际也打在被限速的节点上；绕开分区调度、直接指定 tjupload 才能稳定高速。
+// 若你的网络下某个节点更快，可在管理后台用 upload_host 覆盖（见 diagnose.py）。
 const (
-	defaultUploadHost   = "https://hyupload.pan.wo.cn"
+	defaultUploadHost   = "https://tjupload.pan.wo.cn"
 	defaultTransferHost = "https://b.smartont.net"
 
 	appClientID = "1001000035"
@@ -46,9 +55,7 @@ const (
 	// AES-CBC 固定 IV；key = accessToken[:16]，与 SDK / ltpan.py 完全一致。
 	aesIV = "wNSOYIB1k1DjY5lA"
 
-	// 实测：单个请求体超过约 8MB 时 hyupload 节点会掉到 ~350KB/s 的慢速通道，
-	// 8MB 分片可稳定跑 5-15MB/s。默认与 SDK / 原驱动保持一致，
-	// 也是 ltpan.py 实测高速时使用的尺寸（脚本虽默认 16，但每片严格 <= 分片大小）。
+	// 默认 8MB：与 SDK / 原驱动保持一致，也是服务端合并分片的安全下限。
 	defaultPartSize = int64(8 << 20)
 	// 服务端对分片大小有下限：实测 1MB / 4MB 分片在合并最后一片时返回
 	// HTTP 500，8MB 及以上分片（整除、不整除、多片）均可正常合并。
@@ -281,7 +288,7 @@ type uploadResp struct {
 // fastUpload 是 Put 的实现：
 //  1. 把流式 FileStreamer 缓存成可随机读的 model.File（并发分片 / SHA256 需要）；
 //  2. 可选秒传（命中则直接返回）；
-//  3. 走 hyupload.pan.wo.cn 的 App 通道做多分片并发上传。
+//  3. 走 App 通道（默认 tjupload.pan.wo.cn）做多分片并发上传。
 func (d *Wopan2) fastUpload(ctx context.Context, dstDir model.Obj, stream model.FileStreamer, up driver.UpdateProgress) error {
 	name := stream.GetName()
 	size := stream.GetSize()
@@ -349,12 +356,10 @@ func (d *Wopan2) fastUpload(ctx context.Context, dstDir model.Obj, stream model.
 //   - totalPart = ceil(size / partSize)；
 //   - 每片长度 min(partSize, size-offset)，即任何一片都不会超过 partSize。
 //
-// 这里曾经错误地照搬 wopan-sdk-go 的 floor 算法（最后一片 = 余数 + partSize，
-// 最大可达 2*partSize）。当文件大小不是分片大小的整数倍时——离线下载几乎
-// 必然如此——默认 16MB 配置会产生单个 20MB/24MB/32MB 的巨型请求，实测被
-// hyupload 节点稳定限在约 350KB/s；而此前所有高速回归用例恰好都是 8MB 的
-// 整数倍，floor 与 ceil 结果相同，所以从未暴露。修复后每片 <= partSize，
-// 与 Python 程序字节级一致。
+// 早期版本错误地照搬 wopan-sdk-go 的 floor 算法（最后一片 = 余数 + partSize，
+// 最大可达 2*partSize），与 ltpan.py 不一致，并会产生超过分片大小的请求体。
+// 现已与 Python 程序字节级一致。
+// 注意：上传吞吐的主要决定因素是「上传节点」而非分片算法，见 defaultUploadHost。
 func partLayout(size, partSize int64) (int64, []int64) {
 	if partSize <= 0 {
 		partSize = defaultPartSize
@@ -415,9 +420,14 @@ func (d *Wopan2) uploadParts(ctx context.Context, f model.File, token, name stri
 	var fid string
 	start := time.Now()
 
-	// 按实际发出去的字节连续上报，而不是等整片上传完成才跳一次。
-	// 修复前 8/16MB 分片传输期间进度长时间停在原地，前端按「已传字节/耗时」
-	// 算出的速度被稀释成几十 K，与真实网络吞吐严重不符。
+	// 按实际发出去的字节上报，但必须节流：
+	// up 最终落到 tache.Base.SetProgress，后者每次调用都会 Persist() 写库。
+	// resty 发送 multipart 时每 32KB 左右读一次，若不节流，一个 8MB 分片
+	// 就会产生 250+ 次数据库写，在任务多或磁盘慢的机器上会明显拖慢上传。
+	// 这里按「时间 >=250ms 或进度 >=1%」双重节流，收尾处强制补 100%。
+	var reportMu sync.Mutex
+	var lastReport time.Time
+	var lastPct float64
 	report := func(n int64) {
 		if size <= 0 || n <= 0 {
 			return
@@ -427,6 +437,13 @@ func (d *Wopan2) uploadParts(ctx context.Context, f model.File, token, name stri
 		if p > 100 {
 			p = 100 // 分片重传会让 sent 暂时超过 size，收尾时会强制校正
 		}
+		reportMu.Lock()
+		defer reportMu.Unlock()
+		now := time.Now()
+		if p < 100 && now.Sub(lastReport) < 250*time.Millisecond && p-lastPct < 1 {
+			return
+		}
+		lastReport, lastPct = now, p
 		up(p)
 	}
 
@@ -494,14 +511,18 @@ func (d *Wopan2) uploadParts(ctx context.Context, f model.File, token, name stri
 	up(100)
 	// 服务端按 batchNo + partIndex 自行合并，返回的 fid 仅用于记录。
 	_ = fid
-	if os.Getenv("WOPAN2_DEBUG_PARTS") != "" {
-		elapsed := time.Since(start)
-		var rateMB float64
-		if elapsed > 0 && size > 0 {
-			rateMB = float64(size) / elapsed.Seconds() / 1024 / 1024
-		}
-		log.Warnf("[联通网盘2] 上传完成: %d 片, %d 字节, 耗时 %s, 实测 %.2f MB/s (分片 %dMB, 并发 %d)",
-			totalPart, size, elapsed.Round(time.Millisecond), rateMB, partSize>>20, workers)
+
+	elapsed := time.Since(start)
+	var rateMB float64
+	if elapsed > 0 && size > 0 {
+		rateMB = float64(size) / elapsed.Seconds() / 1024 / 1024
+	}
+	host := cleanHost(d.UploadHost, defaultUploadHost)
+	log.Infof("[联通网盘2] 上传完成: %d 片, %d 字节, 耗时 %s, 实测 %.2f MB/s | 生效配置: 节点=%s 分片=%dMB 并发=%d 秒传=%v 重试=%d",
+		totalPart, size, elapsed.Round(time.Millisecond), rateMB, host, partSize>>20, workers, d.EnableQuick, d.retryTimes())
+	if rateMB < 1.5 {
+		// 用 Warnf 保证即使日志级别设为 warn 也能看到这条关键结论。
+		log.Warnf("[联通网盘2] 实测吞吐仅 %.2f MB/s：当前节点 %s 被服务端限速（换 token、改分片/并发/秒传都无效）。请在管理后台把 upload_host 改为 https://tjupload.pan.wo.cn，或用随附的 diagnose.py 在你的服务器上测出最快节点后填入", rateMB, host)
 	}
 	return nil
 }

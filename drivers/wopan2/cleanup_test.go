@@ -24,7 +24,10 @@ func TestCleanupE2EFiles(t *testing.T) {
 		t.Fatalf("初始化失败: %v", err)
 	}
 
-	prefixes := []string{"openlist_wopan2_test_", "openlist_wopan2_fullput_", "wopan2_probe_", "probe_"}
+	prefixes := []string{
+		"openlist_wopan2_test_", "openlist_wopan2_fullput_", "wopan2_probe_", "probe_",
+		"wopan2_ab_", "wopan2_webchannel_", "wopan2_web_", "wopan2_diag_", "ltpan_ab_",
+	}
 	ctx := context.Background()
 	objs, err := d.List(ctx, &model.Object{ID: "0"}, model.ListArgs{})
 	if err != nil {

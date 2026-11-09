@@ -10,8 +10,8 @@ import (
 	"time"
 )
 
-// TestProbeSinglePartSizes 临时诊断用：测量离线下载常见文件尺寸在默认
-// 16MB 分片配置下，走 App 高速节点的真实单片/多片耗时。
+// TestProbeSinglePartSizes 临时诊断用：测量离线下载常见文件尺寸在指定
+// 分片配置下，走 App 通道的真实单片/多片耗时（WOPAN2_PROBE_CHUNK 指定 MB）。
 func TestProbeSinglePartSizes(t *testing.T) {
 	token := os.Getenv("WOPAN2_E2E_TOKEN")
 	if token == "" {
